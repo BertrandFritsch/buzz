@@ -2329,6 +2329,8 @@ pub async fn run_prompt_task(
     control_rx: Option<tokio::sync::oneshot::Receiver<ControlSignal>>,
     turn_id: String,
 ) {
+    // A cancelled, unpolled prior dispatch must never leak onto setup prompts.
+    agent.acp.set_runtime_dispatch(None);
     // Is this a channel prompt or a heartbeat?
     let source = match &batch {
         Some(b) => PromptSource::Channel(b.scope.clone()),
@@ -2692,7 +2694,7 @@ pub async fn run_prompt_task(
         observer_channel_id,
         Some(session_id.clone()),
         turn_id.clone(),
-        turn_started_at,
+        turn_started_at.clone(),
     ));
     // Backfill liveness's shared session ID so ticks after this point carry
     // it too, matching every other observer frame for this turn.
@@ -3101,6 +3103,21 @@ pub async fn run_prompt_task(
     // the main loop can cancel, interrupt, or rotate it. Heartbeats
     // (control_rx=None) take the simple await path — they are not controllable.
     //
+    // Opt-in host-local execution binding. Only actual batch IDs go out-of-band:
+    // quoted event headers in model-visible text can never create a dispatch binding.
+    // Set immediately before the primary prompt so initial setup prompts do not
+    // inherit assignment metadata. AcpClient consumes this on its next write.
+    agent
+        .acp
+        .set_runtime_dispatch(agent.acp.runtime_dispatch_enabled().then(|| {
+            serde_json::json!({
+                "channel_id": observer_channel_id.map(|id| id.to_string()),
+                "event_ids": triggering_event_ids,
+                "turn_id": turn_id,
+                "started_at": turn_started_at,
+                "harness_pid": std::process::id(),
+            })
+        }));
     let prompt_result = match control_rx {
         None => {
             // Heartbeat / non-cancellable path.
@@ -7384,7 +7401,8 @@ done"#
     }
 
     #[tokio::test]
-    async fn merged_cancel_prompt_commits_and_deduplicates_all_rendered_event_ids() {
+    async fn merged_cancel_prompt_commits_and_deduplicates_all_rendered_event_ids_and_runtime_dispatch(
+    ) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let channel_id = Uuid::new_v4();
@@ -7400,6 +7418,7 @@ done"#
         let next_event = EventBuilder::new(Kind::Custom(9), "ordinary next-turn sentinel")
             .sign_with_keys(&keys)
             .unwrap();
+        let next_event_id = next_event.id.to_hex();
         let merged_batch = FlushBatch {
             channel_id,
             scope: SessionScope::Conversation { channel_id },
@@ -7450,18 +7469,24 @@ done"#
             "buzz-acp-merged-delivery-wire-{}.ndjson",
             Uuid::new_v4()
         ));
-        let quoted_capture = capture.to_string_lossy().replace('\'', "'\\''");
+        let quoted_capture = serde_json::to_string(&capture.to_string_lossy()).unwrap();
         let script = format!(
-            r#"count=0
-while IFS= read -r line; do
-  printf '%s\n' "$line" >> '{quoted_capture}'
-  printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$count,\"result\":{{\"stopReason\":\"end_turn\"}}}}"
-  count=$((count + 1))
-done"#
+            r#"const fs = require('node:fs');
+const input = require('node:readline').createInterface({{input:process.stdin}});
+input.on('line', line => {{
+  fs.appendFileSync({quoted_capture}, line + '\n');
+  const request = JSON.parse(line);
+  process.stdout.write(JSON.stringify({{jsonrpc:'2.0',id:request.id,result:{{stopReason:'end_turn'}}}}) + '\n');
+}});"#
         );
-        let acp = AcpClient::spawn("bash", &["-c".into(), script], &[], false)
-            .await
-            .expect("spawn wire-capture ACP");
+        let acp = AcpClient::spawn(
+            "node",
+            &["-e".into(), script],
+            &[("PELICO_RUNTIME_BINDINGS_DIR".into(), "test-opt-in".into())],
+            false,
+        )
+        .await
+        .expect("spawn wire-capture ACP");
         let mut agent = OwnedAgent {
             index: 0,
             acp,
@@ -7538,6 +7563,22 @@ done"#
             .collect();
         std::fs::remove_file(&capture).expect("remove prompt capture");
         assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0]["params"]["_meta"]["pelicoDispatch"]["channel_id"],
+            channel_id.to_string()
+        );
+        assert_eq!(
+            requests[0]["params"]["_meta"]["pelicoDispatch"]["event_ids"],
+            serde_json::json!([new_event_id])
+        );
+        assert_eq!(
+            requests[0]["params"]["_meta"]["pelicoDispatch"]["turn_id"],
+            "merged-turn"
+        );
+        assert_eq!(
+            requests[1]["params"]["_meta"]["pelicoDispatch"]["event_ids"],
+            serde_json::json!([next_event_id])
+        );
         let wire = |index: usize| {
             requests[index]["params"]["prompt"]
                 .as_array()

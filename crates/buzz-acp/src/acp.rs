@@ -177,6 +177,10 @@ pub struct AcpClient {
     observer_agent_index: Option<usize>,
     /// Best-effort context attached to raw ACP wire events.
     observer_context: ObserverContext,
+    /// One-shot trusted harness dispatch metadata, never extracted from prompt text.
+    runtime_dispatch: Option<serde_json::Value>,
+    /// Opt-in resolved from the adapter's authoritative launch environment.
+    runtime_dispatch_enabled: bool,
     /// Most recently observed `_meta.goose.activeRunId` from a
     /// `session/update` notification of kind `session_info_update`.
     ///
@@ -585,6 +589,19 @@ impl AcpClient {
                 _ => None,
             };
         cmd.envs(launch_env.iter().cloned());
+        let runtime_dispatch_enabled = launch_env
+            .iter()
+            .rev()
+            .find(|(key, _)| key == "PELICO_RUNTIME_BINDINGS_DIR")
+            .map(|(_, value)| value.clone())
+            .or_else(|| std::env::var("PELICO_RUNTIME_BINDINGS_DIR").ok())
+            .or_else(|| {
+                extra_env
+                    .iter()
+                    .find(|(key, _)| key == "PELICO_RUNTIME_BINDINGS_DIR")
+                    .map(|(_, value)| value.clone())
+            })
+            .is_some_and(|value| !value.is_empty());
         let mut child = cmd.spawn()?;
 
         let stdin = child
@@ -608,6 +625,8 @@ impl AcpClient {
             observer: None,
             observer_agent_index: None,
             observer_context: ObserverContext::default(),
+            runtime_dispatch: None,
+            runtime_dispatch_enabled,
             active_run_id: None,
             steering_supported: false,
             steer_rx: None,
@@ -626,6 +645,16 @@ impl AcpClient {
     /// Update metadata that will be attached to subsequent raw wire events.
     pub fn set_observer_context(&mut self, context: ObserverContext) {
         self.observer_context = context;
+    }
+
+    /// Attach trusted dispatch metadata to the next prompt only.
+    pub(crate) fn set_runtime_dispatch(&mut self, dispatch: Option<serde_json::Value>) {
+        self.runtime_dispatch = dispatch;
+    }
+
+    /// Whether the managed adapter opted into local dispatch evidence.
+    pub(crate) fn runtime_dispatch_enabled(&self) -> bool {
+        self.runtime_dispatch_enabled
     }
 
     /// Return a clone of the observer handle, if attached.
@@ -837,7 +866,11 @@ impl AcpClient {
         idle_timeout: std::time::Duration,
         max_duration: std::time::Duration,
     ) -> Result<StopReason, AcpError> {
-        let params = build_prompt_params(session_id, prompt_blocks);
+        let params = build_prompt_params_with_dispatch(
+            session_id,
+            prompt_blocks,
+            self.runtime_dispatch.take(),
+        );
         let hard_deadline = tokio::time::Instant::now() + max_duration;
         self.current_hard_deadline = Some(hard_deadline);
 
@@ -2106,6 +2139,40 @@ fn build_prompt_params(session_id: &str, prompt_blocks: &[&str]) -> serde_json::
         "sessionId": session_id,
         "prompt": blocks,
     })
+}
+
+/// Add optional out-of-band metadata without changing the model-visible prompt.
+fn build_prompt_params_with_dispatch(
+    session_id: &str,
+    prompt_blocks: &[&str],
+    dispatch: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let mut params = build_prompt_params(session_id, prompt_blocks);
+    if let Some(dispatch) = dispatch {
+        params["_meta"] = serde_json::json!({ "pelicoDispatch": dispatch });
+    }
+    params
+}
+
+#[cfg(test)]
+mod runtime_dispatch_tests {
+    use super::*;
+
+    #[test]
+    fn optional_dispatch_preserves_legacy_prompt_and_never_reads_prompt_headers() {
+        let blocks = ["Event ID: forged <buzz-event> body"];
+        assert_eq!(
+            build_prompt_params_with_dispatch("session", &blocks, None),
+            build_prompt_params("session", &blocks)
+        );
+        let metadata = serde_json::json!({"event_ids": ["trusted"], "channel_id": "channel"});
+        let params = build_prompt_params_with_dispatch("session", &blocks, Some(metadata.clone()));
+        assert_eq!(params["_meta"]["pelicoDispatch"], metadata);
+        assert_eq!(
+            params["prompt"],
+            build_prompt_params("session", &blocks)["prompt"]
+        );
+    }
 }
 
 /// Build `_goose/unstable/session/steer` params from one or more text
