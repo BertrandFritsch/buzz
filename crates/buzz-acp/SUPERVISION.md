@@ -67,6 +67,14 @@ executable/argument vectors; there is no implicit shell interpolation. Install
 the helpers and create the watch roots before starting the supervisor.
 Configuration is read at startup; restart the managed instance to apply changes.
 
+Watch roots are recursive and must be readable by the service user, including
+their descendants. Use narrow authority roots and a dedicated configuration
+directory; an unrelated private backup directory below a broad root prevents
+watch registration. Isolate the active supervisor configuration rather than
+changing permissions on unrelated backups. If retaining a legacy helper config
+for rollback, document the active helper config path explicitly and preserve the
+existing authority paths and shared helper serialization state.
+
 ```json
 {
   "version": 1,
