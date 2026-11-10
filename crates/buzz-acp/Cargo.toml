@@ -15,6 +15,10 @@ path = "src/lib.rs"
 name = "buzz-acp"
 path = "src/main.rs"
 
+[[bin]]
+name = "buzz-supervise"
+path = "src/supervise_main.rs"
+
 [dependencies]
 # Internal
 buzz-core = { workspace = true }
@@ -74,6 +78,11 @@ clap = { version = "4", features = ["derive", "env"] }
 # Config file
 toml = "1.0"
 
+# Native mission deadline subscription, crash lock and safe process containment.
+notify = "8"
+fs2 = "0.4"
+process-wrap = { version = "9.1", features = ["tokio1"] }
+
 # Filter expressions
 evalexpr = { workspace = true }
 
@@ -81,6 +90,9 @@ evalexpr = { workspace = true }
 # has a #[cfg(not(unix))] fallback in acp.rs.
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", default-features = false, features = ["signal", "user"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Win32_System_Threading"] }
 
 [dev-dependencies]
 axum = { workspace = true }

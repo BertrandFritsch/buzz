@@ -21,6 +21,7 @@ mod runtime;
 use runtime::{AgentRuntime, PoolStartup, SessionMode};
 mod scope;
 mod setup_mode;
+pub mod supervise;
 mod usage;
 
 pub use usage::TurnUsage;

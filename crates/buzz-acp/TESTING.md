@@ -1,5 +1,8 @@
 # Pi adapter integration
 
+Native deadline supervision configuration, platform containment and operator
+checks are documented in [SUPERVISION.md](SUPERVISION.md).
+
 Buzz uses the [buzz-pi-acp fork](https://github.com/salman1993/buzz-pi-acp).
 Install Node.js 22 or newer, configure Pi, and install the latest development
 adapter from the fork's `main` branch:
